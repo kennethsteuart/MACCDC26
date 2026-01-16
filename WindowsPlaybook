@@ -1,0 +1,170 @@
+The Windows Playbook
+
+
+
+Minute 0: Pre-Flight & Roles
+Identify RDP-capable defenders (“Remote Desktop” group) and assign them least-privilege accounts 
+Firewall rule: allow inbound RDP only for jumpbox
+Split defenders into 2 tracks for parallel execution and coverage:
+PowerShell - script and commands (immediate containment)
+GPO - policy changes across the domain (slower, consistency across all Windows hosts)
+Confirm network profile is not public
+Get-NetConnectionProfile
+Set-NetConnectionProfile -NetworkCategory [either Private or DomainAuthenticated]
+
+1-10: Firewall to Default Deny and Logging.
+Configure Logging - $LogPath is predetermined log path
+Set-NetFirewallProfile -Profile Domain,Public,Private -LogFileName "$LogPath\Firewall.log" 
+Set-NetFirewallProfile -Profile Domain,Public,Private -LogMaxSizeKilobytes 16384 
+Set-NetFirewallProfile -Profile Domain,Public,Private -LogAllowed True
+Set-NetFirewallProfile -Profile Domain,Public,Private -LogBlocked True
+Allow RDP from Jumpbox/White Team only.
+New-NetFirewallRule -DisplayName "SECURE_RDP_JumpboxOnly" ` -Direction Inbound ` 
+-LocalPort 3389 ` 
+-Protocol TCP ` 
+-RemoteAddress $JumpBoxIP ` 
+-Action Allow
+Allow scoreboard stuff?????
+New-NetFirewallRule -DisplayName "SECURE_ScoringEngine" ` -Direction Inbound ` 
+-RemoteAddress $ScoringIP ` 
+-Action Allow
+New-NetFirewallRule -DisplayName "SECURE_ICMP_Ping" ` -Direction Inbound ` 
+-Protocol ICMPv4 ` 
+-Action Allow
+Apply baseline block of all inbound traffic
+Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
+Set-NetFirewallProfile -Profile Domain,Public,Private -DefaultOutboundAction Allow
+Set-NetFirewallProfile -Profile Domain,Public,Private -DefaultInboundAction Block
+
+11-20: Accounts, Passwords, Lockouts
+Enforce strong passwords
+Length: 14+
+History: 24+
+Complexity ON
+net accounts /minpwlen:14 /uniquepw:24
+Password aging
+Max: 90 days, Min: 1 day
+net accounts /maxpwage:90 /minpwage:1
+Lockout threshold to stop brute force attacks
+Threshold: 3
+Duration: 15+
+Reset counter: 15+
+net accounts /lockoutthreshold:5 /lockoutduration:30 /lockoutwindow:30
+Disable guest account
+net user guest /active:no
+Rename admin/guest accounts to non-obvious names (no “Admin” names)
+Verify all changes, keep evidence of changes
+net user guest 
+net user administrator
+net accounts
+
+21-30: Kill the Pivots (Spooler, SMBv1, AutoRun, Remote Assistance)
+Kill Print Spooler
+Stop-Service -Name Spooler -Force -ErrorAction SilentlyContinueAdded detailed administrative playbook for team leaders during competitions, including checklists and time management strategies.
+Set-Service -Name Spooler -StartupType Disabled
+Kill SMBv1
+Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction SilentlyContinue
+Disable Helper/Discovery Services
+$BadServices = @(
+	"RemoteRegistry", 
+	"SSDPSRV", 
+	"upnphost", 
+	"lmhosts", 
+	"TlntSvr", 
+	"SimpTcp"
+) 
+foreach ($Svc in $BadServices) { 
+Stop-Service -Name $Svc -Force -ErrorAction SilentlyContinue Set-Service -Name $Svc -StartupType Disabled 
+}
+Disable Remote Assistance
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' -Name 'fAllowToGetHelp' -Value 0
+Disable Autorun/Autoplay on all drives
+ $AutoRunPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" 
+if (!(Test-Path $AutoRunPath)) { New-Item -Path $AutoRunPath -Force | Out-Null }
+New-ItemProperty -Path $AutoRunPath -Name "NoDriveTypeAutoRun" -Value 255 -PropertyType DWORD -Force | Out-Null
+Disable Autorun/Autoplay on Explorer
+$AutoPlayPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers" 
+if (!(Test-Path $AutoPlayPath)) { New-Item -Path $AutoPlayPath -Force | Out-Null } 
+New-ItemProperty -Path $AutoPlayPath -Name "DisableAutoplay" -Value 1 -PropertyType DWORD -Force | Out-Null
+
+31-40: Credential & Protocol Hardening (LSA, NTLMv2-only, NetBIOS/LLMNR)
+Enable LSA protection (RunAsPPL) and reboot 
+reg add HKLM\SYSTEM\CurrentControlSet\Control\Lsa /v RunAsPPL /t REG_DWORD /d 1 /f
+LAN manager authentication
+Force NTLMv2, refuse LM/NTLM
+GPO: security settings -> local policies -> security options -> network security: LAN manager authentication level
+Disable LLMNR to stop attackers from poisoning name resolution
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\DNSClient" /v EnableMulticast /t REG_DWORD /d 0 /f
+Configure NetBIOS node type (P-node, 2) to prevent broadcast name resolution
+reg add HKLM\SYSTEM\CurrentControlSet\Services\NetBT\Parameters /v NodeType /t REG_DWORD /d 2 /f
+Verify all changes, keep evidence of all changes
+reg query HKLM\SYSTEM\CurrentControlSet\Control\Lsa /v RunAsPPL
+reg query HKLM\SYSTEM\CurrentControlSet\Control\Lsa /v LmCompatibilityLevel
+reg query "HKLM\Software\Policies\Microsoft\Windows NT\DNSClient" /v EnableMulticast
+reg query HKLM\SYSTEM\CurrentControlSet\Services\NetBT\Parameters /v NodeType
+
+41-50: Advanced Auditing (what to log, how to see it fast)
+Force Subcategories: Sets the SCENoApplyLegacyAuditPolicy registry key to ensure these granular settings aren't overwritten by a lazy "Category" Group Policy.
+$LsaPath = "HKLM:\System\CurrentControlSet\Control\Lsa" 
+if (!(Test-Path $LsaPath)) { New-Item -Path $LsaPath -Force | Out-Null } New-ItemProperty -Path $LsaPath -Name "SCENoApplyLegacyAuditPolicy" -Value 1 -PropertyType DWORD -Force | Out-Null 
+Write-Host " - Enforced: Subcategory Audit Policy overrides Legacy." -ForegroundColor Green 
+Command Line Argument Logging: Enables the specific registry key required to see what users typed, not just what they ran.
+$AuditPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit" 
+if (!(Test-Path $AuditPath)) { New-Item -Path $AuditPath -Force | Out-Null } 
+New-ItemProperty -Path $AuditPath -Name "ProcessCreationIncludeCmdLine_Enabled" -Value 1 -PropertyType DWORD -Force | Out-Null 
+Write-Host " - Enforced: Command Line Argument Logging." -ForegroundColor Green
+Granular auditpol: Applies your exact Success/Failure matrix.
+Account Logon
+auditpol /set /subcategory:"Credential Validation" /success:enable /failure:enable
+Logon/Logoff
+auditpol /set /subcategory:"Logon" /success:enable /failure:enable 
+auditpol /set /subcategory:"Logoff" /success:enable /failure:disable auditpol /set /subcategory:"Account Lockout" /success:disable /failure:enable 
+auditpol /set /subcategory:"Special Logon" /success:enable /failure:disable
+Detailed Tracking (Process Creation)
+auditpol /set /subcategory:"Process Creation" /success:enable /failure:disable
+Object Access (File Shares and Removable Drives)
+auditpol /set /subcategory:"File Share" /success:enable /failure:enable auditpol /set /subcategory:"Detailed File Share" /success:disable /failure:enable 
+auditpol /set /subcategory:"Removable Storage" /success:enable /failure:enable
+Policy Change (Firewall and Audit Policy
+auditpol /set /subcategory:"MPSSVC Rule-Level Policy Change" /success:enable /failure:enable 
+auditpol /set /subcategory:"Audit Policy Change" /success:enable /failure:disable
+Privilege Use
+auditpol /set /subcategory:"Sensitive Privilege Use" /success:enable /failure:enable
+System
+auditpol /set /subcategory:"System Integrity" /success:enable /failure:enable
+Check Event Viewer (Security) for Event ID 4688 (Process) & 4625 (Bad Passwords)
+
+51-55: Allow-Lists Only (RDP from jump, required service ports)
+RDP from jump box only
+New-NetFirewallRule -DisplayName "Allow RDP from Jump" -Direction Inbound -Protocol TCP -LocalPort 3389 -RemoteAddress <jumpbox_IP> -Action Allow
+Add inbound rules only for required services
+New-NetFirewallRule -DisplayName "Allow DNS" -Direction Inbound -Protocol UDP -LocalPort 53 -Action Allow
+New-NetFirewallRule -DisplayName "Allow HTTP" -Direction Inbound -Protocol TCP -LocalPort 80 -Action Allow
+New-NetFirewallRule -DisplayName "Allow HTTPS" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow
+No any/any rules
+New-NetFirewallRule -Direction Inbound -Action Allow -RemoteAddress Any
+Verify all changes, keep evidence of all changes
+Get-NetFirewallRule | Where-Object {$_.Direction -eq "Inbound"} | Format-Table Name, Enabled, LocalPort, RemoteAddress
+
+56-60: Verify, Snapshot, Evidence
+Verify Hardening Steps with Hardening Log
+$LogPath = "C:\HardeningLogs" 
+if (!(Test-Path $LogPath)) { New-Item -ItemType Directory -Force -Path $LogPath | Out-Null }
+Verify Audit Policy
+$AuditStatus = auditpol /get /category:* 
+$AuditStatus | Out-File "$LogPath\AuditPolicy_Final.txt" 
+auditpol /get /category:"Detailed Tracking","Logon/Logoff","Object Access"
+Verify Firewall State
+$FW = Get-NetFirewallProfile | Select-Object Name, Enabled, DefaultInboundAction, LogMaxSizeKilobytes 
+foreach ($Profile in $FW) { 
+	if ($Profile.Enabled -eq $True -and $Profile.DefaultInboundAction -eq "Block" -and $Profile.LogMaxSizeKilobytes -ge 16384) { 
+		Write-Host " [PASS] $($Profile.Name): ON | BLOCK | LOGGING ($($Profile.LogMaxSizeKilobytes)KB)" -ForegroundColor Green } 
+	else { 
+Write-Host " [FAIL] $($Profile.Name): Enabled=$($Profile.Enabled) | Inbound=$($Profile.DefaultInboundAction) | LogSize=$($Profile.LogMaxSizeKilobytes)" -ForegroundColor Red 
+	}
+ }
+Verify Killed Services
+$Spooler = Get-Service Spooler -ErrorAction SilentlyContinue if ($Spooler.Status -eq "Stopped" -and $Spooler.StartType -eq "Disabled") { Write-Host " [PASS] Spooler is STOPPED and DISABLED." -ForegroundColor Green } else { Write-Host " [FAIL] Spooler is $($Spooler.Status) / $($Spooler.StartType)" -ForegroundColor Red }
+try { $SMBv1 = Get-SmbServerConfiguration | Select-Object EnableSMB1Protocol if ($SMBv1.EnableSMB1Protocol -eq $False) { Write-Host " [PASS] SMBv1 is DISABLED." -ForegroundColor Green } else { Write-Host " [FAIL] SMBv1 is ENABLED." -ForegroundColor Red } } catch { Write-Host " [INFO] SMBv1 Check skipped (Command not found - likely already removed)." -ForegroundColor Gray }
+Export Security Config
+cmd.exe /c "secedit /export /cfg $LogPath\Final_Security_Baseline.inf" if (Test-Path "$LogPath\Final_Security_Baseline.inf") { Write-Host " [PASS] Secedit config saved to $LogPath\Final_Security_Baseline.inf" -ForegroundColor Green } else { Write-Host " [FAIL] Secedit export failed." -ForegroundColor Red } 
