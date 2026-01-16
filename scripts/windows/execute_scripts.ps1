@@ -1,1 +1,2 @@
-icacls *.sh /grant Everyone:F
+icacls *.ps1 /grant Everyone:F
+
