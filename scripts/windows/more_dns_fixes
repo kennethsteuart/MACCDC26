@@ -1,0 +1,72 @@
+# ============================================
+# MACCDC DNS Recovery Script
+# Fixes local DNS issues preventing Basic dcdiag
+# Run as Administrator on the DC
+# ============================================
+
+Write-Host "=== Starting DNS recovery ===" -ForegroundColor Cyan
+
+# 1️⃣ Ensure DNS Server service exists and is running
+if (Get-Service dns -ErrorAction SilentlyContinue) {
+    Write-Host "[*] DNS service found. Restarting..."
+    Restart-Service dns -Force
+} else {
+    Write-Host "[-] DNS Server service not installed. Installing DNS Server role..."
+    Install-WindowsFeature DNS -IncludeManagementTools -Restart:$false
+}
+
+# 2️⃣ Ensure DNS PowerShell module is available
+if (-not (Get-Module -ListAvailable -Name DnsServer)) {
+    Write-Host "[*] Installing DNS Server Tools..."
+    Add-WindowsFeature RSAT-DNS-Server
+}
+Import-Module DnsServer -ErrorAction SilentlyContinue
+
+# 3️⃣ Restore DNS listening addresses
+$dcIP = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Ethernet" | Where-Object {$_.PrefixOrigin -ne "WellKnown"}).IPAddress
+Write-Host "[*] Setting DNS listen addresses to 127.0.0.1 and $dcIP"
+Set-DnsServer -ListenAddresses ("127.0.0.1",$dcIP,"::1") -ErrorAction SilentlyContinue
+Restart-Service dns -Force
+
+# 4️⃣ Clear DNS cache
+Write-Host "[*] Clearing DNS cache"
+dnscmd /clearcache
+
+# 5️⃣ Ensure localhost is correct in hosts file
+$hostsPath = "C:\Windows\System32\drivers\etc\hosts"
+if (-not (Select-String -Path $hostsPath -Pattern "127\.0\.0\.1\s+localhost")) {
+    Write-Host "[*] Adding localhost entry to hosts file"
+    Add-Content -Path $hostsPath -Value "`n127.0.0.1`tlocalhost"
+}
+if (-not (Select-String -Path $hostsPath -Pattern "::1\s+localhost")) {
+    Add-Content -Path $hostsPath -Value "`n::1`tlocalhost"
+}
+
+# 6️⃣ Force DC to register its DNS records
+Write-Host "[*] Registering DC records in DNS"
+ipconfig /registerdns
+
+# 7️⃣ Temporarily allow DNS and RPC in firewall
+Write-Host "[*] Fixing firewall rules for local DNS and RPC"
+$fwRules = @(
+    @{Name="Allow DNS TCP"; Protocol="TCP"; Port=53},
+    @{Name="Allow DNS UDP"; Protocol="UDP"; Port=53},
+    @{Name="Allow RPC TCP 135"; Protocol="TCP"; Port=135},
+    @{Name="Allow RPC Dynamic TCP"; Protocol="TCP"; Port="49152-65535"}
+)
+foreach ($rule in $fwRules) {
+    if (-not (Get-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -DisplayName $rule.Name -Direction Inbound -Protocol $rule.Protocol -LocalPort $rule.Port -Action Allow -Profile Domain | Out-Null
+        Write-Host "[+] Firewall rule $($rule.Name) created"
+    }
+}
+
+# 8️⃣ Reset LSA anonymous restrictions (optional recovery)
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RestrictAnonymousSAM" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RestrictAnonymous" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+
+# 9️⃣ Restart DNS again to ensure changes applied
+Restart-Service dns -Force
+
+Write-Host "=== DNS recovery script complete ===" -ForegroundColor Green
+Write-Host "Now test: nslookup localhost" -ForegroundColor Yellow
