@@ -43,6 +43,10 @@ Every system has weak/default credentials. Priority order:
 ```bash
 configure
 
+set system login user vyos authentication plaintext-password <new_password>
+set system login user myadmin full-name "Mountaineer"
+set system login user myadmin authentication plaintext-password mysecurepassword
+
 # === INBOUND FROM INTERNET ===
 set firewall ipv4 name WAN-TO-LAN default-action drop
 set firewall ipv4 name WAN-TO-LAN enable-default-log
